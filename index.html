@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Image Studio Pro</title>
+
+<style>
+body{
+  margin:0;
+  font-family:system-ui;
+  background:#0b1220;
+  color:#fff;
+  overflow:hidden;
+}
+
+.app{
+  display:grid;
+  grid-template-columns:320px 1fr;
+  height:100vh;
+}
+
+.sidebar{
+  background:#111a2e;
+  padding:12px;
+  overflow:auto;
+}
+
+canvas{
+  width:100%;
+  height:100%;
+  background:#000;
+  display:block;
+}
+
+.section{
+  margin-bottom:14px;
+  padding-bottom:10px;
+  border-bottom:1px solid #2a3550;
+}
+
+button{
+  width:100%;
+  padding:10px;
+  margin-top:6px;
+  border:0;
+  border-radius:8px;
+  cursor:pointer;
+}
+
+input, select{
+  width:100%;
+  margin-top:6px;
+}
+
+.previewBar{
+  position:absolute;
+  bottom:0;
+  left:320px;
+  right:0;
+  display:flex;
+  gap:10px;
+  padding:10px;
+  background:#0f1730;
+  overflow:auto;
+}
+
+.card{
+  min-width:220px;
+  background:#1a2542;
+  padding:8px;
+  border-radius:10px;
+}
+.small{font-size:12px;opacity:.8}
+</style>
+</head>
+
+<body>
+
+<div class="app">
+
+  <div class="sidebar">
+
+    <div class="section">
+      <h3>Images</h3>
+      <input id="imgInput" type="file" multiple accept="image/*">
+    </div>
+
+    <div class="section">
+      <h3>Watermark</h3>
+      <input id="wmInput" type="file" accept="image/*">
+
+      <label>Opacity</label>
+      <input id="wmOpacity" type="range" min="0" max="1" step="0.01" value="0.6">
+
+      <label>Size</label>
+      <input id="wmSize" type="range" min="5" max="50" value="20">
+
+      <label>Position</label>
+      <select id="wmPos">
+        <option value="br">Bottom Right</option>
+        <option value="bl">Bottom Left</option>
+        <option value="tr">Top Right</option>
+        <option value="tl">Top Left</option>
+      </select>
+    </div>
+
+    <div class="section">
+      <button id="clear">Clear</button>
+    </div>
+
+  </div>
+
+  <canvas id="c"></canvas>
+
+</div>
+
+<div class="previewBar" id="bar"></div>
+
+<script>
+
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+
+let W,H;
+function resize(){
+  W = canvas.width = window.innerWidth - 320;
+  H = canvas.height = window.innerHeight;
+}
+window.onresize = resize;
+resize();
+
+// ---------------- STATE ----------------
+let images = [];
+let active = 0;
+
+let watermark = null;
+
+let wm = {
+  opacity:0.6,
+  size:20,
+  pos:"br"
+};
+
+// PER-SIZE CROP STATE (FIX)
+const outputs = [
+  {w:1080,h:1350, state:{x:0,y:0,zoom:1}},
+  {w:1080,h:1920, state:{x:0,y:0,zoom:1}},
+  {w:1920,h:1080, state:{x:0,y:0,zoom:1}}
+];
+
+// ---------------- LOAD IMAGES ----------------
+document.getElementById("imgInput").onchange = async e=>{
+  images=[];
+  for(let f of e.target.files){
+    let img=new Image();
+    img.src=URL.createObjectURL(f);
+    await img.decode();
+    images.push(img);
+  }
+  render();
+  buildPreviews();
+};
+
+// ---------------- WATERMARK ----------------
+document.getElementById("wmInput").onchange = async e=>{
+  let f=e.target.files[0];
+  if(!f) return;
+  watermark=new Image();
+  watermark.src=URL.createObjectURL(f);
+  await watermark.decode();
+  render();
+  buildPreviews();
+};
+
+document.getElementById("wmOpacity").oninput=e=>{
+  wm.opacity=+e.target.value;
+  buildPreviews();
+};
+
+document.getElementById("wmSize").oninput=e=>{
+  wm.size=+e.target.value;
+  buildPreviews();
+};
+
+document.getElementById("wmPos").onchange=e=>{
+  wm.pos=e.target.value;
+  buildPreviews();
+};
+
+// ---------------- GLOBAL CROP (active image only preview) ----------------
+let dragging=false;
+let start={x:0,y:0};
+
+canvas.onmousedown=e=>{
+  dragging=true;
+  start.x=e.clientX;
+  start.y=e.clientY;
+};
+
+window.onmouseup=()=>dragging=false;
+
+window.onmousemove=e=>{
+  if(!dragging||!images.length) return;
+
+  let o = outputs[0].state; // active preview base reference
+
+  o.x += e.clientX-start.x;
+  o.y += e.clientY-start.y;
+
+  start.x=e.clientX;
+  start.y=e.clientY;
+
+  render();
+};
+
+// zoom
+canvas.onwheel=e=>{
+  e.preventDefault();
+  let o=outputs[0].state;
+  o.zoom*=e.deltaY>0?0.95:1.05;
+  o.zoom=Math.max(1,Math.min(6,o.zoom));
+  render();
+};
+
+// ---------------- DRAW IMAGE ----------------
+function draw(img,w,h,st){
+
+  let scale=Math.max(w/img.width,h/img.height)*st.zoom;
+
+  let dw=img.width*scale;
+  let dh=img.height*scale;
+
+  let x=(w-dw)/2+st.x;
+  let y=(h-dh)/2+st.y;
+
+  ctx.drawImage(img,x,y,dw,dh);
+}
+
+// ---------------- WATERMARK (FIXED PADDING) ----------------
+function drawWM(w,h){
+
+  if(!watermark) return;
+
+  ctx.globalAlpha=wm.opacity;
+
+  let pad=16; // FIXED INSET
+
+  let size=Math.min(w,h)*(wm.size/100);
+
+  let ratio=watermark.width/watermark.height;
+
+  let ww=size;
+  let wh=size/ratio;
+
+  let x=pad,y=pad;
+
+  if(wm.pos==="br"){x=w-ww-pad;y=h-wh-pad;}
+  if(wm.pos==="bl"){x=pad;y=h-wh-pad;}
+  if(wm.pos==="tr"){x=w-ww-pad;y=pad;}
+  if(wm.pos==="tl"){x=pad;y=pad;}
+
+  ctx.drawImage(watermark,x,y,ww,wh);
+  ctx.globalAlpha=1;
+}
+
+// ---------------- RENDER MAIN CANVAS ----------------
+function render(){
+
+  ctx.clearRect(0,0,W,H);
+
+  if(!images.length) return;
+
+  let img=images[active];
+
+  draw(img,W,H,outputs[0].state);
+  drawWM(W,H);
+}
+
+// ---------------- PREVIEWS (PER-SIZE STATE FIX) ----------------
+function buildPreviews(){
+
+  let bar=document.getElementById("bar");
+  bar.innerHTML="";
+
+  if(!images.length) return;
+
+  for(let img of images){
+
+    outputs.forEach((o,i)=>{
+
+      let c=document.createElement("div");
+      c.className="card";
+
+      let url=exportImg(img,o);
+
+      c.innerHTML=`
+        <div class="small">${o.w}x${o.h}</div>
+        <img src="${url}" style="width:100%">
+        <button onclick="dl('${url}','img.jpg')">Download</button>
+      `;
+
+      bar.appendChild(c);
+
+    });
+
+  }
+}
+
+// ---------------- EXPORT (USES PER-SIZE STATE FIX) ----------------
+function exportImg(img,o){
+
+  let c=document.createElement("canvas");
+  c.width=o.w;
+  c.height=o.h;
+
+  let xctx=c.getContext("2d");
+
+  let st=o.state;
+
+  let scale=Math.max(o.w/img.width,o.h/img.height)*st.zoom;
+
+  let dw=img.width*scale;
+  let dh=img.height*scale;
+
+  let x=(o.w-dw)/2+st.x;
+  let y=(o.h-dh)/2+st.y;
+
+  xctx.drawImage(img,x,y,dw,dh);
+
+  if(watermark){
+
+    xctx.globalAlpha=wm.opacity;
+
+    let pad=16;
+
+    let s=Math.min(o.w,o.h)*(wm.size/100);
+
+    let ww=s;
+    let wh=s/(watermark.width/watermark.height);
+
+    let wx=pad,wy=pad;
+
+    if(wm.pos==="br"){wx=o.w-ww-pad;wy=o.h-wh-pad;}
+    if(wm.pos==="bl"){wx=pad;wy=o.h-wh-pad;}
+    if(wm.pos==="tr"){wx=o.w-ww-pad;wy=pad;}
+    if(wm.pos==="tl"){wx=pad;wy=pad;}
+
+    xctx.drawImage(watermark,wx,wy,ww,wh);
+  }
+
+  return c.toDataURL("image/jpeg",1.0);
+}
+
+// ---------------- DOWNLOAD ----------------
+function dl(url,name){
+  let a=document.createElement("a");
+  a.href=url;
+  a.download=name;
+  a.click();
+}
+
+// ---------------- CLEAR ----------------
+document.getElementById("clear").onclick=()=>{
+  images=[];
+  watermark=null;
+  outputs.forEach(o=>{
+    o.state={x:0,y:0,zoom:1};
+  });
+  render();
+  document.getElementById("bar").innerHTML="";
+};
+
+// INIT
+render();
+
+</script>
+
+</body>
+</html>
